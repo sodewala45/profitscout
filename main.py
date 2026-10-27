@@ -483,6 +483,29 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
     )
     already = credits_v2.is_unlocked(user_email, product_id, platform)
 
+    # Pre-sourced mode (default): suppliers are found in a batch after each Kalodata import
+    # (python -m sourcing.presource --new). Users never trigger a live search and are never
+    # charged for a product that has no suppliers yet.
+    if platform in ("alibaba", "aliexpress") and not has_cache and os.getenv("PRESOURCE_ONLY", "true") == "true":
+        last = (
+            supabase.table("sourcing_jobs").select("status, finished_at")
+            .eq("product_id", str(product_id)).eq("platform", platform)
+            .order("id", desc=True).limit(1).execute().data
+        )
+        state = last[0]["status"] if last else "pending"
+        msg = (
+            f"No {platform.title()} supplier matched this product's photo."
+            if state == "no_match"
+            else f"{platform.title()} suppliers for this product are being prepared. Check back soon."
+        )
+        out = {"success": False, "status": "not_sourced" if state != "no_match" else "no_match",
+               "platform": platform, "suppliers": [], "credit_charged": False, "message": msg}
+        try:
+            out["credits"] = credits_v2.get_balance(user_email)
+        except credits_v2.CreditError:
+            pass
+        return out
+
     charged = False
     if not has_cache and not already:
         try:

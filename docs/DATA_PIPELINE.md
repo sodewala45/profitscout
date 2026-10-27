@@ -10,7 +10,11 @@
    python import_kalodata.py products "data/2026-11-02/*.csv" --rehost
    python import_kalodata.py creators data/2026-11-02/creators.csv
    ```
-5. Week 1: stages show "Unknown/Emerging" and growth is blank (honest: no history yet).
+5. Find suppliers for the new products (see docs/PRESOURCING.md):
+   ```
+   python -m sourcing.presource --new
+   ```
+6. Week 1: stages show "Unknown/Emerging" and growth is blank (honest: no history yet).
    From week 2 on, growth and Emerging/Rising/Peaking/Saturated come from real snapshots.
 
 Rules:
