@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 from . import config, match
-from .http_sources import aliexpress_by_text, alibaba_by_image, alibaba_by_text, keyword_from_title
+from .http_sources import aliexpress_by_image, aliexpress_by_text, alibaba_by_image, alibaba_by_text, keyword_from_title
 from .oxylabs import Budget, OxylabsError
 from .store import save_suppliers
 
@@ -70,7 +70,7 @@ def source_one(product: dict, platform: str, budget: Budget, client: httpx.Clien
     tried, top = [], 0.0
 
     steps = [("photo", lambda: alibaba_by_image(ref, budget)), ("text", lambda: alibaba_by_text(kw, budget))] \
-        if platform == "alibaba" else [("text", lambda: aliexpress_by_text(kw, budget))]
+        if platform == "alibaba" else [("photo", lambda: aliexpress_by_image(ref, budget)), ("text", lambda: aliexpress_by_text(kw, budget))]
 
     for method, run in steps:
         try:

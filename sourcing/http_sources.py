@@ -130,6 +130,61 @@ a an the and or for with of to in on by from your you my our new hot best top sa
 """.split())
 
 
+AE_COOKIES = {"aep_usuc_f": "site=glo&c_tp=USD&region=US&b_locale=en_US", "intl_locale": "en_US"}
+AE_MTOP_API = "mtop.relationrecommend.aliexpressrecommend.recommend"
+AE_MTOP_KEY = "24815441"   # AliExpress web app key (public, from its own page header script)
+
+
+def _ae_mtop(client: httpx.Client, data: str) -> dict:
+    import hashlib
+    tk = (client.cookies.get("_m_h5_tk") or "").split("_")[0]
+    t = str(int(time.time() * 1000))
+    sign = hashlib.md5(f"{tk}&{t}&{AE_MTOP_KEY}&{data}".encode()).hexdigest()
+    q = {"jsv": "2.5.1", "appKey": AE_MTOP_KEY, "t": t, "sign": sign, "api": AE_MTOP_API, "v": "1.0",
+         "type": "originaljson", "dataType": "json", "timeout": "50000"}
+    r = client.post(f"https://acs.aliexpress.com/h5/{AE_MTOP_API}/1.0/", params=q, data={"data": data},
+                    headers={**UA, "Origin": "https://www.aliexpress.com", "Referer": "https://www.aliexpress.com/"},
+                    timeout=60)
+    return r.json()
+
+
+def aliexpress_upload(photo: bytes) -> str:
+    """Same call AliExpress's camera button makes: sends the photo, returns its image-search fileId. Free."""
+    import base64
+    params = {"platform": "pc", "page": 1, "pageSize": 60, "isNewImageSearch": True, "osf": "pc_web_image_search",
+              "clientType": "pc", "searchBizScene": "imageSearch", "subScenario": "imageUpload",
+              "image_base64": base64.b64encode(_as_jpeg(photo)).decode(), "shpt_co": "US", "_currency": "USD",
+              "sortType": "default", "sortOrder": "default", "contentType": "imageUpload", "lang": "en",
+              "locale": "en_US"}
+    data = json.dumps({"appId": 21738, "params": json.dumps(params)}, separators=(",", ":"))
+    with httpx.Client(follow_redirects=True, cookies=AE_COOKIES) as c:
+        j = _ae_mtop(c, data)                      # 1st call only hands out the session token
+        if "TOKEN" in " ".join(j.get("ret") or []):
+            j = _ae_mtop(c, data)
+    d = j.get("data") or {}
+    if not d.get("fileId"):
+        raise RuntimeError(f"AliExpress image upload refused: {(j.get('ret') or ['?'])[0][:80]}")
+    return d["fileId"]
+
+
+def aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
+    """AliExpress photo search: upload (free), then read the results page directly; Oxylabs only if blocked."""
+    file_id = aliexpress_upload(photo)
+    url = "https://www.aliexpress.com/w/wholesale-.html?isNewImageSearch=y&filename=" + quote(file_id, safe="")
+    html = ""
+    try:
+        r = httpx.get(url, headers={**UA, "Accept-Language": "en-US"}, cookies=AE_COOKIES,
+                      follow_redirects=True, timeout=40)
+        html = r.text if r.status_code == 200 else ""
+    except Exception:
+        pass
+    offers = parse.aliexpress_offers(parse.json_blobs_from_html(html)) if html else []
+    if not offers:   # challenge page / blocked: same page through Oxylabs (1 paid result)
+        html = scrape({"source": "universal", "url": url, "render": "html", "geo_location": "United States"}, budget)
+        offers = parse.aliexpress_offers(parse.json_blobs_from_html(html))
+    return offers
+
+
 def keyword_from_title(title: str, words: int = 6) -> str:
     t = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", title or "")          # drop (...) [...] notes
     t = re.split(r"[|,;:/]| - ", t)[0] if len(t) > 60 else t       # keep the head of long titles
