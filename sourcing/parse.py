@@ -48,6 +48,14 @@ def _walk(obj: Any) -> Iterable[dict]:
 def json_blobs_from_html(html: str) -> list:
     """Embedded JSON: window._dida_config_, window.runParams, __INIT_DATA__, etc."""
     blobs = []
+    # AliExpress search: the result cards live in "itemList":{"content":[...]}
+    for m in re.finditer(r'"itemList"\s*:\s*\{', html):
+        chunk = _balanced(html, m.end() - 1)
+        if chunk:
+            try:
+                blobs.append(json.loads(chunk))
+            except Exception:
+                pass
     for m in re.finditer(r"<script[^>]*>(.*?)</script>", html, re.S | re.I):
         text = m.group(1)
         if len(text) < 2000 or ("productId" not in text and "offerId" not in text and "subject" not in text):
@@ -101,8 +109,12 @@ def aliexpress_offers(blobs: list) -> list[dict]:
             orig = prices.get("originalPrice") or {}
             if not (prices or d.get("price") or d.get("salePrice") or d.get("target_sale_price")):
                 continue
-            welcome = prices.get("builderType") == "skuCoupon" or (_f(sale.get("discount")) or 0) >= 85
-            pmin = _f(orig.get("minPrice")) if welcome else (_f(sale.get("minPrice")) or _f(orig.get("minPrice")))
+            # 85%+ off = new-user welcome deal (not a real cost). Coupon pricing: prefer the pre-coupon price.
+            welcome = (_f(sale.get("discount")) or 0) >= 85
+            if welcome or prices.get("builderType") == "skuCoupon":
+                pmin = _f(orig.get("minPrice")) or (None if welcome else _f(sale.get("minPrice")))
+            else:
+                pmin = _f(sale.get("minPrice")) or _f(orig.get("minPrice"))
             pmin = pmin or _f(d.get("salePrice")) or _f(d.get("price")) or _f(d.get("target_sale_price"))
             if not pmin:
                 continue
@@ -114,15 +126,16 @@ def aliexpress_offers(blobs: list) -> list[dict]:
             trade = d.get("trade") or {}
             ev = d.get("evaluation") or {}
             seen.add(str(pid))
+            item_id = int(pid) - 2**51 if str(pid).startswith("3256") else pid   # search ids are offset by 2^51
             out.append(
                 {
                     "platform": "aliexpress",
-                    "product_id": str(pid),
+                    "product_id": str(item_id),
                     "title": (title or "")[:300],
                     "price_min": round(pmin, 2),
                     "price_max": round(_f(orig.get("maxPrice")) or _f(orig.get("minPrice")) or pmin, 2),
                     "moq": 1,
-                    "url": f"https://www.aliexpress.com/item/{pid}.html",
+                    "url": f"https://www.aliexpress.com/item/{item_id}.html",
                     "image_url": _abs(img),
                     "supplier_name": (store.get("storeName") if isinstance(store, dict) else None) or "AliExpress store",
                     "supplier_years": None,

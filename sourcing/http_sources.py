@@ -1,8 +1,9 @@
 """
 Supplier sources over plain HTTP + Oxylabs Web Scraper API. No browser.
 
-  alibaba_by_image(photo)   upload the photo to Alibaba's own image-search storage (a normal web
-                            request, free), then fetch the results page through Oxylabs (1 result).
+  alibaba_by_image(photo)   upload the photo to Alibaba's image-search storage and call Alibaba's own
+                            image-search JSON API. Both are plain web requests: free. Oxylabs is only
+                            used as a fallback if Alibaba rate-limits us.
   alibaba_by_text(title)    Oxylabs source alibaba_search (1 result)
   aliexpress_by_text(title) Oxylabs source aliexpress_search (1 result)
 
@@ -12,6 +13,7 @@ so text search is only a way to get candidates; the photo decides what is a matc
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import string
@@ -72,11 +74,42 @@ def _alibaba_from_html(html: str) -> list[dict]:
     return parse.alibaba_offers_from_dom(cards)
 
 
+IMG_SEARCH_API = "https://open-s.alibaba.com/openservice/imageSearchViewService"
+
+
+def _as_jpeg(photo: bytes) -> bytes:
+    """TikTok/AliExpress CDNs often serve WebP/AVIF; Alibaba's image search only reads real JPEGs."""
+    import io
+    from PIL import Image
+    try:
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(photo)).convert("RGB").save(buf, "JPEG", quality=90)
+        return buf.getvalue()
+    except Exception:
+        return photo
+
+
 def alibaba_by_image(photo: bytes, budget: Budget) -> list[dict]:
-    key = alibaba_upload(photo)
-    url = f"https://www.alibaba.com/picture/search.htm?imageType=oss&escapeQp=true&imageAddress=/{quote(key)}&sourceFrom=imageupload"
-    html = scrape({"source": "alibaba", "url": url, "render": "html", "geo_location": "United States"}, budget)
-    return _alibaba_from_html(html)
+    """Alibaba's own image-search JSON API (the one its results page calls). Free; Oxylabs only if blocked."""
+    key = alibaba_upload(_as_jpeg(photo))
+    params = {"appName": "magellan", "appKey": "a5m1ismomeptugvfmkkjnwwqnwyrhpb1", "imageType": "oss",
+              "imageAddress": "/" + key, "beginPage": 1, "pageSize": 40, "language": "en_US"}
+    data = None
+    try:
+        r = httpx.get(IMG_SEARCH_API, params=params, headers=UA, timeout=30)
+        j = r.json()
+        if "SUCCESS" in " ".join(j.get("ret") or []):
+            data = j.get("data") or {}
+    except Exception:
+        pass
+    if data is None:  # rate-limited / challenge: same request through Oxylabs (1 paid result)
+        url = str(httpx.URL(IMG_SEARCH_API, params=params))
+        raw = scrape({"source": "universal", "url": url, "geo_location": "United States"}, budget)
+        try:
+            data = json.loads(raw).get("data") or {}
+        except Exception:
+            data = {}
+    return parse.alibaba_offers([data.get("offers") or []])
 
 
 def alibaba_by_text(keyword: str, budget: Budget) -> list[dict]:
