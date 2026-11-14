@@ -42,5 +42,8 @@ That runs, in order:
 
 One-time setup:
 - GitHub repo `sodewala45/profitscout` > Settings > Secrets and variables > Actions > New repository secret:
-  `SUPABASE_URL`, `SUPABASE_KEY` (service_role), `OXYLABS_USER`, `OXYLABS_PASS`.
-- A fine-grained GitHub token (repo: profitscout only, permission Actions: Read and write) saved on Render as `GITHUB_ACTIONS_TOKEN`.
+  `SUPABASE_URL`, `SUPABASE_KEY` (service_role), `OXYLABS_WEB_API_KEY` (Oxylabs Web API key; username/password is no longer used).
+- A GitHub token saved on Render as `GITHUB_ACTIONS_TOKEN`. A fine-grained token must be created **by the repo owner's account**
+  (resource owner `sodewala45`, repository `profitscout`, permission Actions: Read and write). A fine-grained token made by a
+  collaborator account can't reach a repo owned by another account, which gives the 403 on "Find suppliers".
+  Alternative: a classic token with the `repo` and `workflow` scopes from an account with write access.

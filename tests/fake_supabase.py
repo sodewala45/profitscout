@@ -66,8 +66,18 @@ class Query:
         return self._f(fn)
 
     def ilike(self, c, pat):
-        g = pat.replace("%", "*").replace("_", "?").lower()
-        return self._f(lambda r: fnmatch.fnmatchcase(str(r.get(c) or "").lower(), g))
+        # Postgres ILIKE: % = any run, _ = one char, backslash escapes the next character.
+        import re as _re
+        rx, i = "", 0
+        while i < len(pat):
+            ch = pat[i]
+            if ch == "\\" and i + 1 < len(pat):
+                rx += _re.escape(pat[i + 1]); i += 2
+                continue
+            rx += ".*" if ch == "%" else "." if ch == "_" else _re.escape(ch)
+            i += 1
+        cre = _re.compile(rx + r"\Z", _re.I | _re.S)
+        return self._f(lambda r: bool(cre.match(str(r.get(c) or ""))))
 
     def is_(self, c, v):
         want = {"null": None, "true": True, "false": False}[str(v)]
@@ -78,15 +88,34 @@ class Query:
         return self._f(lambda r: str(r.get(c)) in vals)
 
     def or_(self, expr):
-        def fn(r):
-            for part in expr.split(","):
-                col, op, val = part.split(".", 2)
-                if op == "gte" and r.get(col) is not None and float(r.get(col)) >= float(val):
-                    return True
-                if op == "eq" and str(r.get(col)) == val:
-                    return True
-            return False
-        return self._f(fn)
+        """PostgREST or=(...) with eq / gte / is.null / not.is.null parts and nested and(...)."""
+        def split(e):
+            parts, depth, cur = [], 0, ""
+            for ch in e:
+                if ch == "," and depth == 0:
+                    parts.append(cur); cur = ""
+                    continue
+                depth += ch == "("
+                depth -= ch == ")"
+                cur += ch
+            return parts + ([cur] if cur else [])
+
+        def test(part, r):
+            if part.startswith("and(") and part.endswith(")"):
+                return all(test(p, r) for p in split(part[4:-1]))
+            col, rest = part.split(".", 1)
+            if rest == "is.null":
+                return r.get(col) is None
+            if rest == "not.is.null":
+                return r.get(col) is not None
+            op, val = rest.split(".", 1)
+            if op == "gte":
+                return r.get(col) is not None and float(r.get(col)) >= float(val)
+            if op == "eq":
+                return str(r.get(col)) == val
+            raise NotImplementedError(part)
+
+        return self._f(lambda r: any(test(p, r) for p in split(expr)))
 
     def order(self, c, desc=False, nullsfirst=None):
         self.orders.append((c, desc))
@@ -134,6 +163,16 @@ class Query:
                 r = dict(r)
                 r.setdefault("id", len(rows) + 1)
                 rows.append(r)
+            return Result(copy.deepcopy(new))
+        if self.op == "upsert":
+            new = self.payload if isinstance(self.payload, list) else [self.payload]
+            keys = [k.strip() for k in (self.on_conflict or "id").split(",")]
+            for r in new:
+                cur = next((x for x in rows if all(x.get(k) == r.get(k) for k in keys)), None)
+                if cur is not None:
+                    cur.update(copy.deepcopy(r))
+                else:
+                    rows.append(copy.deepcopy(r))
             return Result(copy.deepcopy(new))
         match = [r for r in rows if all(f(r) for f in self.filters)]
         if self.op == "update":

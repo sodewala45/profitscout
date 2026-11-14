@@ -675,6 +675,8 @@ def import_products(paths, dry_run=False, rehost=False, deactivate=False, log=pr
         p["virality_score"] = momentum_score(rev_day, growth, p["creator_count"], p["creator_conversion_pct"], p["rating"])
         if p.get("shop_name") is None:
             p.pop("shop_name", None)                 # unknown: don't blank a stored shop name
+        if not p.get("thumbnail_url"):
+            p.pop("thumbnail_url", None)             # no image in this export: keep the stored one
         if rehost and p["thumbnail_url"]:
             url = rehost_image(sb, p["tiktok_product_id"], p["thumbnail_url"], log=log)
             if url:

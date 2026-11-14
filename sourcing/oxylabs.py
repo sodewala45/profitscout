@@ -1,8 +1,18 @@
 """
-Oxylabs Web Scraper API client (the cheap one, billed per successful result, about $1.15-1.35 per 1,000).
-No Agent Browser, no Playwright. Same account the old pipelines use.
+Oxylabs Web API client (https://developers.oxylabs.io/products/web-api). One credential:
 
-Env: OXYLABS_USER / OXYLABS_PASS   (OXYLABS_USERNAME / OXYLABS_PASSWORD also accepted)
+  OXYLABS_WEB_API_KEY   the API key of the Web API instance, sent as  Authorization: Bearer <key>
+
+Endpoint POST https://webapi.oxylabs.io/v1/scrape, body {"url", "output": ["html"], "location", "run_js"}.
+It fetches one page URL and returns its HTML. Billed per successful result.
+
+The old username/password "Web Scraper API" (realtime.oxylabs.io + OXYLABS_USER / OXYLABS_PASS) is gone:
+the account only has an API key, and the 2026-11-14 run fell back to a stale username/password and
+got 401 on every paid call while the run still reported success.
+
+Errors:
+  OxylabsError and its subclasses   STOP the whole run (bad key, no quota, request rejected, budget used).
+  RuntimeError                      one page failed; the caller treats that product as failed and goes on.
 """
 
 from __future__ import annotations
@@ -16,16 +26,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-USER = os.getenv("OXYLABS_USER") or os.getenv("OXYLABS_USERNAME")
-PASS = os.getenv("OXYLABS_PASS") or os.getenv("OXYLABS_PASSWORD")
-ENDPOINT = "https://realtime.oxylabs.io/v1/queries"
-# Newer Oxylabs "Web API" product: one API key (Bearer), endpoint webapi.oxylabs.io/v1/scrape.
 WEB_API_KEY = (os.getenv("OXYLABS_WEB_API_KEY") or "").strip()
 WEB_API_ENDPOINT = "https://webapi.oxylabs.io/v1/scrape"
+TIMEOUT = 150            # docs: at least 150 s when the page is rendered with JavaScript
 
 
 class OxylabsError(Exception):
-    pass
+    """Fatal for the run."""
+
+
+class OxylabsAuthError(OxylabsError):
+    """401 / 403, or no key at all."""
+
+
+class OxylabsQuotaError(OxylabsError):
+    """402, or 429 that still fails after the retries (plan quota / traffic used up)."""
+
+
+class OxylabsRequestError(OxylabsError):
+    """400 / 422: Oxylabs rejected the request itself, so every later call would fail too."""
+
+
+class BudgetExhausted(OxylabsError):
+    """The run's own --max-requests cap. Not an error in the account: the next run continues."""
 
 
 class Budget:
@@ -39,15 +62,42 @@ class Budget:
     def take(self) -> None:
         with self._lock:
             if self.used >= self.max:
-                raise OxylabsError(f"request budget of {self.max} reached")
+                raise BudgetExhausted(f"request budget of {self.max} Oxylabs results reached")
             self.used += 1
 
 
-def _web_api_scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
-    """Same job through the Web API key: fetch one URL, return its HTML."""
+def configured() -> bool:
+    return bool(WEB_API_KEY)
+
+
+def redact(text) -> str:
+    """Never let the key reach a log line, even if a response echoes the header back."""
+    t = str(text or "")
+    return t.replace(WEB_API_KEY, "***") if WEB_API_KEY else t
+
+
+def _snippet(r: httpx.Response) -> str:
+    try:
+        body = r.text
+    except Exception:
+        body = ""
+    return redact(" ".join(body[:200].split()))
+
+
+def _target_status(res: dict):
+    try:
+        return int(((res.get("metadata") or {}).get("statuses") or {}).get("http_request", {}).get("code"))
+    except Exception:
+        return None
+
+
+def scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
+    """HTML of payload["url"] through the Web API. payload["render"] (any value) turns on run_js."""
+    if not WEB_API_KEY:
+        raise OxylabsAuthError("OXYLABS_WEB_API_KEY is not set (Oxylabs dashboard > Web API instance > API key)")
     url = payload.get("url")
     if not url:
-        raise RuntimeError(f"Oxylabs Web API key only supports page URLs, not source={payload.get('source')}")
+        raise OxylabsRequestError(f"Oxylabs Web API only fetches page URLs; got source={payload.get('source')!r}")
     body = {"url": url, "output": ["html"], "location": "US"}
     if payload.get("render"):
         body["run_js"] = True
@@ -56,61 +106,54 @@ def _web_api_scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
     for attempt in range(retries + 1):
         budget.take()
         try:
-            r = httpx.post(WEB_API_ENDPOINT, json=body, headers=headers, timeout=150)
+            r = httpx.post(WEB_API_ENDPOINT, json=body, headers=headers, timeout=TIMEOUT)
         except httpx.HTTPError as e:
             last = f"network: {type(e).__name__}"
             time.sleep(3 * (attempt + 1))
             continue
-        if r.status_code == 401:
-            raise OxylabsError("Oxylabs rejected OXYLABS_WEB_API_KEY (401). Copy the key again from the Web API instance.")
-        if r.status_code == 429 and attempt == retries:
-            raise OxylabsError("Oxylabs Web API: rate limit or free quota used up (429). Check Billing in the dashboard.")
-        if r.status_code in (408, 429) or r.status_code >= 500:
-            last = f"HTTP {r.status_code}"
+        code = r.status_code
+        if code in (401, 403):
+            raise OxylabsAuthError(f"Oxylabs rejected OXYLABS_WEB_API_KEY (HTTP {code}): {_snippet(r)}. "
+                                   "Copy the key again from the Web API instance in the Oxylabs dashboard.")
+        if code == 402:
+            raise OxylabsQuotaError(f"Oxylabs: no traffic left on the plan (HTTP 402): {_snippet(r)}")
+        if code in (400, 422):
+            raise OxylabsRequestError(f"Oxylabs refused the request (HTTP {code}): {_snippet(r)}")
+        if code == 429:
+            text = _snippet(r)
+            if "quota" in text.lower() or attempt == retries:
+                raise OxylabsQuotaError(f"Oxylabs: rate limit or plan quota reached (HTTP 429): {text}")
+            last = "HTTP 429"
+            time.sleep(5 * (attempt + 1))
+            continue
+        if code == 408 or code >= 500:
+            last = f"HTTP {code}: {_snippet(r)}"
             time.sleep(3 * (attempt + 1))
             continue
-        if not (200 <= r.status_code < 300):
-            raise RuntimeError(f"Oxylabs Web API HTTP {r.status_code}: {r.text[:200]}")
-        res = (r.json().get("results") or [{}])[0]
+        if not (200 <= code < 300):
+            raise RuntimeError(f"Oxylabs Web API HTTP {code}: {_snippet(r)}")
+        try:
+            data = r.json()
+        except ValueError:
+            last = f"HTTP {code} but the body is not JSON: {_snippet(r)}"
+            print(f"  oxylabs: {last}")
+            time.sleep(2 * (attempt + 1))
+            continue
+        state = (data or {}).get("state")
+        if state and state != "done":                      # pending / faulted
+            last = f"job state {state}"
+            time.sleep(3 * (attempt + 1))
+            continue
+        res = ((data or {}).get("results") or [{}])[0] or {}
         html = res.get("html") or res.get("content") or ""
         if isinstance(html, list):
             html = "".join(map(str, html))
+        target = _target_status(res)
+        if target is not None and target >= 400 and not html:
+            last = f"target answered HTTP {target}"
+            continue
         if html:
             return html if isinstance(html, str) else str(html)
         last = "empty page"
         body["run_js"] = True          # docs: an empty shell means the page needs JavaScript
-    raise RuntimeError(f"Oxylabs Web API failed: {last}")
-
-
-def scrape(payload: dict, budget: Budget, retries: int = 2) -> str:
-    """Returns page HTML. Raises OxylabsError on auth problems or repeated failure.
-    Uses OXYLABS_WEB_API_KEY when set, else OXYLABS_USER/OXYLABS_PASS (classic Web Scraper API)."""
-    if WEB_API_KEY:
-        return _web_api_scrape(payload, budget, retries)
-    if not (USER and PASS):
-        # Not a run-stopper: the free direct photo search is the main path, Oxylabs only the fallback.
-        raise RuntimeError("blocked and no Oxylabs fallback (set OXYLABS_WEB_API_KEY or OXYLABS_USER / OXYLABS_PASS)")
-    last = "unknown"
-    for attempt in range(retries + 1):
-        budget.take()
-        try:
-            r = httpx.post(ENDPOINT, auth=(USER, PASS), json=payload, timeout=180)
-        except httpx.HTTPError as e:
-            last = f"network: {e}"
-            time.sleep(3 * (attempt + 1))
-            continue
-        if r.status_code == 401:
-            raise OxylabsError("Oxylabs rejected the username/password (401). Create a Web Scraper API user in the Oxylabs dashboard.")
-        if r.status_code in (402, 403):
-            raise OxylabsError(f"Oxylabs account has no traffic left ({r.status_code}). Top up in the dashboard.")
-        if r.status_code != 200:
-            last = f"HTTP {r.status_code}: {r.text[:200]}"
-            time.sleep(3 * (attempt + 1))
-            continue
-        res = (r.json().get("results") or [{}])[0]
-        content = res.get("content") or ""
-        if res.get("status_code", 200) >= 400 or not content:
-            last = f"target returned {res.get('status_code')}"
-            continue
-        return content if isinstance(content, str) else str(content)
-    raise OxylabsError(last)
+    raise RuntimeError(f"Oxylabs Web API failed for this page: {last}")

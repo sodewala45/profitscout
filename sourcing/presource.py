@@ -14,6 +14,15 @@ Oxylabs is only used when a site blocks the direct request (about 1 paid result 
 
 Cost guard: --max-requests (default 300) stops the run before it can overspend.
 Typical cost: 1-2 results per product per platform, about $0.003-0.005 per product for both.
+
+Needs OXYLABS_WEB_API_KEY (the only Oxylabs credential). --allow-no-oxylabs runs the free direct
+searches only (blocked pages are then 'failed', never paid for).
+
+Exit codes (GitHub Actions marks the run failed on anything but 0):
+  0  finished (or stopped at --max-requests; the next run carries on)
+  2  OXYLABS_WEB_API_KEY missing
+  3  stopped: Oxylabs refused the key / quota used up / request rejected
+  4  nothing worked: every attempted product failed (marketplaces blocked the runner)
 """
 
 from __future__ import annotations
@@ -33,13 +42,24 @@ from supabase import create_client
 
 from . import config, match
 from .http_sources import aliexpress_by_image, aliexpress_by_text, alibaba_by_image, alibaba_by_text, keyword_from_title
-from .oxylabs import Budget, OxylabsError
+from . import oxylabs
+from .oxylabs import Budget, BudgetExhausted, OxylabsError
 from .store import clear_auto_suppliers, save_candidates, save_suppliers
 
 from db_paging import fetch_all  # repo root (run as python -m sourcing.presource)
 
 load_dotenv()
-sb = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+class _LazyClient:
+    """Supabase client made on first use, so importing this module (tests, --help) needs no env."""
+    _client = None
+
+    def __getattr__(self, name):
+        if _LazyClient._client is None:
+            _LazyClient._client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+        return getattr(_LazyClient._client, name)
+
+
+sb = _LazyClient()
 IMG_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 PLATFORMS = ("alibaba", "aliexpress")
 # One Supabase client is shared by all workers; its HTTP/2 connection is not thread-safe
@@ -192,9 +212,15 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--max-requests", type=int, default=300, help="hard cap on paid Oxylabs results this run")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--workers", type=int, default=int(os.getenv("SOURCING_WORKERS", "8")),
-                    help="products sourced at the same time (default 8)")
+    ap.add_argument("--workers", type=int, default=int(os.getenv("SOURCING_WORKERS", "1")),
+                    help="products sourced at the same time (default 1: one at a time)")
+    ap.add_argument("--allow-no-oxylabs", action="store_true",
+                    help="run without OXYLABS_WEB_API_KEY (free direct searches only)")
     a = ap.parse_args()
+    if not oxylabs.configured() and not (a.allow_no_oxylabs or a.dry_run):
+        print("::error::OXYLABS_WEB_API_KEY is empty. Add it as a repo secret (Settings > Secrets and variables > "
+              "Actions), or pass --allow-no-oxylabs for a free-only run.")
+        sys.exit(2)
     platforms = PLATFORMS if a.platform == "both" else (a.platform,)
     budget = Budget(a.max_requests)
 
@@ -216,6 +242,7 @@ def main() -> None:
     stats = {"done": 0, "no_match": 0, "failed": 0}
     t0 = time.time()
     stop = threading.Event()
+    stopped: dict = {}                              # the first fatal Oxylabs error
 
     def work(item):
         i, (p, pl) = item
@@ -225,12 +252,14 @@ def main() -> None:
             with httpx.Client(headers=IMG_UA, follow_redirects=True) as client:
                 res = source_one(p, pl, budget, client)
         except OxylabsError as e:
-            if not stop.is_set():
-                print(f"\nSTOPPED: {e}")
+            with lock:
+                if not stopped:
+                    stopped["error"] = e
+                    print(f"\nSTOPPED: {oxylabs.redact(e)}")
             stop.set()
             return
         except Exception as e:                      # one bad product must not stop the run
-            res = {"status": "failed", "error": f"{type(e).__name__}: {e}"[:300]}
+            res = {"status": "failed", "error": oxylabs.redact(f"{type(e).__name__}: {e}")[:300]}
         with lock:
             stats[res["status"]] += 1
         if not a.product:
@@ -246,6 +275,26 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
         list(pool.map(work, enumerate(targets, 1)))
     print(f"\n{stats} · {budget.used} Oxylabs results used · {time.time() - t0:.0f}s")
+    sys.exit(exit_code(stats, stopped.get("error"), len(targets)))
+
+
+def exit_code(stats: dict, stopped_by: Exception | None, n_targets: int) -> int:
+    """Turn the run's outcome into an exit code and a GitHub annotation (see the module docstring)."""
+    attempted = sum(stats.values())
+    left = max(0, n_targets - attempted)
+    if isinstance(stopped_by, BudgetExhausted):
+        print(f"::warning::Stopped at the Oxylabs budget ({stopped_by}). {left} product/platform pairs left; "
+              "run Find suppliers again (mode new) to continue.")
+        return 0
+    if stopped_by is not None:
+        print(f"::error::Find suppliers stopped: {oxylabs.redact(stopped_by)}. {left} pairs were not sourced.")
+        return 3
+    if attempted and stats["done"] + stats["no_match"] == 0:
+        print(f"::error::All {attempted} attempted pairs failed (marketplace blocked or broken). See the log lines above.")
+        return 4
+    if stats["failed"]:
+        print(f"::warning::{stats['failed']} of {attempted} pairs failed; they are retried on the next run.")
+    return 0
 
 
 if __name__ == "__main__":

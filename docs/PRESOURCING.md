@@ -22,8 +22,8 @@ Cost: 1 to 3 Oxylabs results per product for both platforms, roughly $0.003 to $
 The free trial's 2,000 results cover roughly 600 to 900 products.
 
 ## Setup (once)
-1. Oxylabs dashboard: Web Scraper API, then create an API user. Put it in `.env`:
-   `OXYLABS_USER=...` and `OXYLABS_PASS=...`
+1. Oxylabs dashboard: open the Web API instance and copy its API key. Put it in `.env`:
+   `OXYLABS_WEB_API_KEY=...` (the only Oxylabs credential; sent as `Authorization: Bearer`)
 2. `pip install -r requirements-presource.txt` (downloads CLIP weights on first run, about 600 MB)
 3. Railway API service: leave `PRESOURCE_ONLY` unset (defaults to true). `PHOTO_WORKER_ENABLED` stays false.
 

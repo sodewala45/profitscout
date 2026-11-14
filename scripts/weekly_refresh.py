@@ -10,7 +10,7 @@ Folder layout (one Kalodata export per file, same 7-day date range every week):
   data/2026-11-09/shops.csv        optional
 
 Runs on your PC (CLIP needs ~600 MB and is free locally). Needs .env with SUPABASE_URL,
-SUPABASE_KEY (service role) and OXYLABS_USER / OXYLABS_PASS.
+SUPABASE_KEY (service role) and OXYLABS_WEB_API_KEY.
 """
 import glob
 import os

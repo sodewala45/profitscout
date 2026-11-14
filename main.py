@@ -208,6 +208,9 @@ def require_admin(request: Request):
 
 
 FREE_PRODUCT_LIMIT = 10
+# "Hot" means one thing in the whole app: virality_score >= 80 (/stats.hot, the "Score 80+" tile,
+# /products/tier/hot). The life-cycle stage once stored as "hot" is "emerging" (see product_stage).
+HOT_MIN_SCORE = 80
 FREE_CACHE_SECONDS = 300
 MIN_SIMILARITY = float(os.getenv("SOURCING_MIN_SIMILARITY", "0.80"))
 # Matching off (default since 2026-11-11): unscored "auto" rows from sourcing are shown, top 3.
@@ -223,22 +226,42 @@ def gate_list(plan: str, limit: int, offset: int) -> tuple[int, int]:
     return limit, offset
 
 
+ADMIN_PLAN = "ultimate"
+
+
+def access_plan(user, db_plan: Optional[str]) -> str:
+    """The plan that decides what a caller may SEE (catalogue, search, shops, creators, listing tool).
+    Admins (ADMIN_USER_IDS, or a confirmed address in ADMIN_EMAILS) see everything, like Ultimate.
+    This is never written back to users.plan: credits (plan_allowance() in SQL) and Lemon Squeezy
+    keep using the stored plan, so a webhook can't be confused and nothing about billing changes."""
+    if user is not None and is_admin(user):
+        return ADMIN_PLAN
+    return normalize_plan(db_plan)
+
+
+def _db_plan(email: str) -> str:
+    """users.plan for this email; 'free' when there is no row or the lookup fails (fail closed)."""
+    try:
+        rows = supabase.table("users").select("plan").eq("user_email", normalize_email(email)).limit(1).execute().data
+        return normalize_plan(rows[0].get("plan") if rows else None)
+    except Exception:
+        logger.exception("plan lookup failed")
+        return "free"
+
+
 def get_user_plan(request: Request) -> str:
-    """Plan of the signed-in caller: 'free' (also for signed-out), 'pro' or 'ultimate'. Sync on purpose:
-    callers are plain `def` routes, so the GoTrue + DB round-trips run in the threadpool."""
+    """Plan of the signed-in caller: 'free' (also for signed-out), 'pro' or 'ultimate'. Admins count as
+    'ultimate' (see access_plan). Sync on purpose: callers are plain `def` routes, so the GoTrue + DB
+    round-trips run in the threadpool."""
     user = credits_v2.user_from_request(request)
     if not user:
         return "free"
-    try:
-        result = supabase.table("users").select("plan").eq("user_email", user.email).limit(1).execute()
-        plan = normalize_plan(result.data[0].get("plan") if result.data else None)
-    except Exception:
-        logger.exception("get_user_plan failed")
-        return "free"
+    if is_admin(user):
+        return ADMIN_PLAN               # no DB round-trip needed
     # No ensure_user_credits() here any more: get_credit_balance() takes a FOR UPDATE row lock and
     # ran on every list page (5 parallel /products calls per Products load). /credits and
     # consume_credit() both create / roll over the credit row themselves.
-    return plan
+    return access_plan(user, _db_plan(user.email))
 
 
 def ensure_user_credits(user_email: str, plan: str):
@@ -314,6 +337,22 @@ def _stage_query_values(stage: str) -> list:
             "hot": ["hot", "emerging"], "pass": ["pass", "saturated"],
             "watch": ["watch", "peaking", "unknown"]}
     return back.get(stage, [stage])
+
+
+def _stage_filter(query, stage: str):
+    """DB filter for a stage name (v2 or v1). v1 "watch" rows hold both peaking (growth known) and
+    unknown (growth unknown), so those two are told apart by gmv_growth_pct, inside the query."""
+    st = stage.strip().lower()
+    if st == "peaking":
+        return query.or_("trend_phase.eq.peaking,and(trend_phase.eq.watch,gmv_growth_pct.not.is.null)")
+    if st == "unknown":
+        return query.or_("trend_phase.eq.unknown,and(trend_phase.eq.watch,gmv_growth_pct.is.null)")
+    return query.in_("trend_phase", _stage_query_values(st))
+
+
+def _like_exact(text: str) -> str:
+    """ILIKE pattern that matches `text` exactly (case-insensitive): % and _ are escaped."""
+    return text.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 # Paid catalogue pages and /stats are the same for every caller and only change on an import:
@@ -411,6 +450,7 @@ def get_products(
     category:    Optional[str]  = Query(default=None),
     min_price:   Optional[float]= Query(default=None),
     max_price:   Optional[float]= Query(default=None),
+    shop_name:   Optional[str]  = Query(default=None, max_length=300, description="Exact shop name (case-insensitive)"),
     limit:       int            = Query(default=20,  ge=1, le=100),
     offset:      int            = Query(default=0,   ge=0),
     api_key:     str            = Security(verify_api_key),
@@ -431,20 +471,21 @@ def get_products(
                 .lte("virality_score", max_score)
             )
             if trend_phase:
-                query = query.in_("trend_phase", _stage_query_values(trend_phase))
+                query = _stage_filter(query, trend_phase)
             if category:
                 query = query.ilike("category", f"%{category}%")
             if min_price is not None:
                 query = query.gte("tiktok_price", min_price)
             if max_price is not None:
                 query = query.lte("tiktok_price", max_price)
-            rows = present_products(_order_products(query).range(offset, offset + limit - 1).execute().data)
-            want = (trend_phase or "").strip().lower()
-            if want in V2_STAGES:   # v1 "watch" holds both peaking and unknown
-                rows = [r for r in rows if r.get("trend_phase") == want]
-            return rows
+            if shop_name:
+                query = query.ilike("shop_name", _like_exact(shop_name))
+            # The stage filter runs in the DB (see _stage_filter): filtering after .range() made
+            # pages shorter than `limit`, which a client reads as "last page".
+            return present_products(_order_products(query).range(offset, offset + limit - 1).execute().data)
 
-        key = ("paid-products", min_score, max_score, trend_phase, category, min_price, max_price, limit, offset)
+        key = ("paid-products", min_score, max_score, trend_phase, category, min_price, max_price, shop_name,
+               limit, offset)
         rows = _cached(key, load, LIST_CACHE_SECONDS)
 
         return {
@@ -508,8 +549,8 @@ def get_products_by_tier(
     api_key: str = Security(verify_api_key),
 ):
     tier_ranges = {           # (min inclusive, max inclusive); queried as >= min and < next floor
-        "hot":    (80, 100),
-        "rising": (65, 79),
+        "hot":    (HOT_MIN_SCORE, 100),
+        "rising": (65, HOT_MIN_SCORE - 1),
         "watch":  (50, 64),
         "pass":   (0,  49),
     }
@@ -578,9 +619,10 @@ def _load_stats() -> dict:
         return count_exact(build)
 
     total  = n()
-    hot    = n(80)
-    rising = n(65, 80)
+    hot    = n(HOT_MIN_SCORE)
+    rising = n(65, HOT_MIN_SCORE)
     watch  = n(50, 65)
+    low    = n(None, 50)
 
     rows = fetch_all(lambda: supabase.table("tiktok_products")
                      .select("id, category, trend_phase, gmv_growth_pct, data_end_date, window_days")
@@ -603,10 +645,20 @@ def _load_stats() -> dict:
         "success": True,
         "stats": {
             "total_products": total,
-            # score buckets (labelled "Score 80+" etc. in the UI)
+            # Score buckets, labelled "Score 80+" etc. in the UI. These legacy keys are the SAME
+            # numbers as score_tiers below and as /products/tier/{hot|rising|watch|pass}.
             "hot":            hot,
             "rising":         rising,
             "watch":          watch,
+            # One definition everywhere: "hot" = virality_score >= 80. Life-cycle stages
+            # (emerging / rising / peaking / saturated / unknown) are a separate axis, never "hot".
+            "score_tiers": {
+                "score_80_plus": hot,
+                "score_65_79":   rising,
+                "score_50_64":   watch,
+                "score_below_50": low,
+            },
+            "hot_definition": f"virality_score >= {HOT_MIN_SCORE}",
             # life-cycle stages, v2 names, active rows only
             "stages":         stages,
             "data_end_date":  max(end_dates) if end_dates else None,
@@ -865,13 +917,8 @@ _amazon_inflight_lock = threading.Lock()
 
 
 def _plan_for_email(email: str) -> str:
-    """users.plan for this email; 'free' when there is no row or the lookup fails (fail closed)."""
-    try:
-        rows = supabase.table("users").select("plan").eq("user_email", normalize_email(email)).limit(1).execute().data
-        return normalize_plan(rows[0].get("plan") if rows else None)
-    except Exception:
-        logger.exception("plan lookup failed")
-        return "free"
+    """Stored users.plan (kept for callers that only have an email; access checks use access_plan)."""
+    return _db_plan(email)
 
 
 def _safe_is_unlocked(email: str, product_id: str, platform: str) -> bool:
@@ -910,7 +957,7 @@ def _supplier_search(product_id: str, platform: str, request: Request, photo: bo
 
     # Free plan: suppliers only for the fixed top 10 (audit S3). Checked before any charge.
     # A product the user already unlocked (e.g. it left the top 10 since) stays free to reopen.
-    if not is_paid(_plan_for_email(user_email)) and pid not in free_top_product_ids():
+    if not is_paid(get_user_plan(request)) and pid not in free_top_product_ids():
         if not _safe_is_unlocked(user_email, product_id, platform):
             raise HTTPException(status_code=403, detail={"code": "upgrade_required", "message": UPGRADE_MESSAGE})
 
@@ -1607,7 +1654,7 @@ def generate_listing(req: GenerateListingRequest, request: Request, user=Depends
     if not user:
         raise HTTPException(status_code=401, detail="Sign in to generate listings")
     email = user.email
-    if not is_paid(credits_v2.plan_for(email)):
+    if not is_paid(access_plan(user, credits_v2.plan_for(email))):
         raise HTTPException(status_code=402, detail="The listing generator is a Pro feature")
     if not (GROQ_API_KEY or openai_sync_client):
         raise HTTPException(status_code=503, detail="Listing generator is not configured")
@@ -1709,11 +1756,109 @@ def get_shops(
             "shops": res.data,
             "total": res.count,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
+            "plan": plan,
+            # The shops table is a separate (older) Kalodata shop export: it has no data date.
+            # /shops/catalogue is built from the current product list instead.
+            "source": "shops_table",
         }
     except Exception:
         # Was a 200 with an empty list, so the page said "no shops" during an outage.
         raise server_error("/shops")
+
+
+def _shop_key(name) -> str:
+    return " ".join(str(name or "").split()).lower()
+
+
+def _load_catalogue_shops() -> dict:
+    """Shops behind the ACTIVE products, from tiktok_products.shop_name (filled by every import).
+    Real numbers only: product count, revenue in the export window, share of the list's revenue,
+    revenue-weighted growth, and the shop's top products. The older shops table is joined by name
+    for profile fields (followers, link) where a row exists."""
+    rows = fetch_all(lambda: supabase.table("tiktok_products")
+                     .select("id, product_name, shop_name, revenue_window, window_days, gmv_growth_pct, "
+                             "virality_score, data_end_date, thumbnail_url, image_storage_url")
+                     .eq("is_active", True).order("id"))
+    total_rev = sum(float(r.get("revenue_window") or 0) for r in rows)
+    groups: dict = {}
+    no_shop = 0
+    for r in rows:
+        key = _shop_key(r.get("shop_name"))
+        if not key:
+            no_shop += 1
+            continue
+        g = groups.setdefault(key, {"shop_name": " ".join(str(r["shop_name"]).split()), "products": []})
+        g["products"].append(r)
+    profiles = {}
+    try:
+        for sh in fetch_all(lambda: supabase.table("shops")
+                            .select("shop_name, follower_count, shop_url, seller_type, image_url")
+                            .order("id")):
+            profiles.setdefault(_shop_key(sh.get("shop_name")), sh)
+    except Exception:
+        logger.warning("shops profile join failed; catalogue shops are shown without profiles")
+    out = []
+    for key, g in groups.items():
+        prods = g["products"]
+        rev = sum(float(p.get("revenue_window") or 0) for p in prods)
+        weighted = [(float(p["gmv_growth_pct"]), float(p.get("revenue_window") or 0)) for p in prods
+                    if p.get("gmv_growth_pct") is not None]
+        wsum = sum(w for _, w in weighted)
+        growth = (round(sum(g_ * w for g_, w in weighted) / wsum, 1) if wsum
+                  else (round(sum(g_ for g_, _ in weighted) / len(weighted), 1) if weighted else None))
+        windows = {p.get("window_days") for p in prods if p.get("window_days")}
+        top = sorted(prods, key=lambda p: (-(float(p.get("revenue_window") or 0)), str(p.get("id"))))[:3]
+        prof = profiles.get(key) or {}
+        out.append({
+            "shop_name": g["shop_name"],
+            "product_count": len(prods),
+            "revenue_window": round(rev, 2),
+            "window_days": next(iter(windows)) if len(windows) == 1 else None,
+            "revenue_share_pct": round(rev / total_rev * 100, 2) if total_rev else None,
+            "growth_pct": growth,
+            "best_score": max((p.get("virality_score") or 0) for p in prods),
+            "data_end_date": max((str(p["data_end_date"])[:10] for p in prods if p.get("data_end_date")), default=None),
+            "top_products": [{"id": p["id"], "product_name": p.get("product_name"),
+                              "virality_score": p.get("virality_score"),
+                              "revenue_window": p.get("revenue_window"),
+                              "image": p.get("image_storage_url") or p.get("thumbnail_url")} for p in top],
+            "follower_count": prof.get("follower_count"),
+            "shop_url": prof.get("shop_url"),
+            "seller_type": prof.get("seller_type"),
+            "image_url": prof.get("image_url"),
+            "has_shop_profile": bool(prof),
+        })
+    out.sort(key=lambda x: (-x["revenue_window"], x["shop_name"].lower()))
+    return {"shops": out, "catalogue_revenue": round(total_rev, 2), "products_without_shop": no_shop,
+            "active_products": len(rows)}
+
+
+@app.get("/shops/catalogue")
+@limiter.limit(LIST_LIMIT, key_func=ip_key)
+def get_catalogue_shops(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    api_key: str = Security(verify_api_key),
+):
+    """Shops ranked by revenue in the current product list, with product count and revenue share.
+    Free: the top 10 shops, and only top products that are in the free top 10."""
+    plan = get_user_plan(request)
+    try:
+        data = _cached("catalogue-shops", _load_catalogue_shops, LIST_CACHE_SECONDS)
+        shops = data["shops"]
+        if not is_paid(plan):
+            free_ids = free_top_product_ids()
+            page = [dict(s, top_products=[p for p in s["top_products"] if str(p["id"]) in free_ids])
+                    for s in shops[:FREE_PRODUCT_LIMIT]]
+            return {"shops": page, "total": len(page), "limit": FREE_PRODUCT_LIMIT, "offset": 0, "plan": plan,
+                    "catalogue_revenue": data["catalogue_revenue"], "source": "catalogue"}
+        return {"shops": shops[offset:offset + limit], "total": len(shops), "limit": limit, "offset": offset,
+                "plan": plan, "catalogue_revenue": data["catalogue_revenue"],
+                "products_without_shop": data["products_without_shop"], "source": "catalogue"}
+    except Exception:
+        raise server_error("/shops/catalogue")
 
 # ─── Get Creators ─────────────────────────────────────────────────
 @app.get("/creators")
@@ -2104,6 +2249,18 @@ def admin_me(request: Request, user=Depends(resolve_user), api_key: str = Securi
     return {"admin": is_admin(user)}
 
 
+@app.get("/me")
+@limiter.limit(POLL_LIMIT)
+def me(request: Request, user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
+    """What the UI needs to show the right plan: `plan` is what the caller can see (admins = ultimate),
+    `billing_plan` is the stored users.plan that credits and Lemon Squeezy use."""
+    if not user:
+        return {"signed_in": False, "plan": "free", "billing_plan": "free", "admin": False}
+    admin = is_admin(user)
+    billing = _db_plan(user.email)
+    return {"signed_in": True, "plan": access_plan(user, billing), "billing_plan": billing, "admin": admin}
+
+
 @app.get("/admin/review/queue")
 @limiter.limit(ADMIN_LIMIT)
 def admin_review_queue(
@@ -2329,10 +2486,93 @@ _GH_REF = os.getenv("GITHUB_REF", "main")
 _GH_WORKFLOW = os.getenv("GITHUB_SOURCING_WORKFLOW", "presource.yml")
 
 
+# Import jobs used to live only in _IMPORT_JOBS (this process's memory): a Render restart or deploy
+# mid-import lost the job, the page polled into a 404 and nobody knew how far it got. Real imports
+# are now also saved to the import_jobs table (migration 20261114_core_logic.sql). Without that
+# table the API keeps working from memory only and logs one warning.
+_JOB_TABLE = "import_jobs"
+_JOB_HEARTBEAT_SECONDS = 15
+_JOB_STALE_SECONDS = 120          # a "running" row not updated for this long belongs to a dead process
+_job_store = {"ok": True}
+_JOB_PRIVATE = ("dir", "_saved")
+
+
+def _job_view(job: dict) -> dict:
+    return {k: v for k, v in job.items() if k not in _JOB_PRIVATE}
+
+
+def _persist_job(job: dict, force: bool = False) -> None:
+    if job.get("dry_run") or not _job_store["ok"] or not job.get("id"):
+        return
+    now = time.time()
+    if not force and now - job.get("_saved", 0) < 5:
+        return
+    job["_saved"] = now
+    row = {"id": job["id"], "status": job["status"], "started_by": job.get("by"),
+           "started_at": job.get("started_at"), "finished_at": job.get("finished_at"),
+           "files": job.get("files") or [], "summary": job.get("summary"),
+           "warnings": job.get("warnings") or [], "error": job.get("error"),
+           "log": (job.get("log") or [])[-400:], "updated_at": _now()}
+    try:
+        supabase.table(_JOB_TABLE).upsert(row, on_conflict="id").execute()
+    except Exception as e:
+        _job_store["ok"] = False
+        logger.warning("import job not saved to %s (%s); jobs are kept in memory only. Run "
+                       "supabase/migrations/20261114_core_logic.sql", _JOB_TABLE, type(e).__name__)
+
+
+def _stored_job(job_id: str) -> Optional[dict]:
+    if not _job_store["ok"]:
+        return None
+    try:
+        rows = supabase.table(_JOB_TABLE).select("*").eq("id", job_id).limit(1).execute().data
+    except Exception:
+        return None
+    if not rows:
+        return None
+    job = dict(rows[0])
+    job["by"] = job.pop("started_by", None)
+    job["dry_run"] = False
+    return _mark_if_interrupted(job)
+
+
+def _mark_if_interrupted(job: dict) -> dict:
+    """A stored 'running' job that this process isn't running and that stopped sending heartbeats
+    was cut off by a restart. Say so instead of showing 'running' forever."""
+    if job.get("status") != "running" or job.get("id") in _IMPORT_JOBS:
+        return job
+    try:
+        seen = datetime.fromisoformat(str(job.get("updated_at") or job.get("started_at")).replace("Z", "+00:00"))
+        age = (datetime.now(timezone.utc) - seen).total_seconds()
+    except Exception:
+        age = _JOB_STALE_SECONDS + 1
+    if age <= _JOB_STALE_SECONDS:
+        return job
+    job.update(status="failed", finished_at=job.get("finished_at") or _now(),
+               error="The server restarted during this import, so it stopped part-way. Run the same files "
+                     "again; it's safe to repeat.")
+    job["log"] = list(job.get("log") or []) + [f"Stopped: {job['error']}"]
+    try:
+        supabase.table(_JOB_TABLE).update({"status": "failed", "error": job["error"], "log": job["log"][-400:],
+                                           "finished_at": job["finished_at"], "updated_at": _now()}) \
+            .eq("id", job["id"]).eq("status", "running").execute()
+    except Exception:
+        pass
+    return job
+
+
 def _run_import(job: dict, files: list, dry_run: bool, rehost: bool, deactivate: bool):
     def log(msg=""):
         job["log"].append(str(msg))
         job["log"] = job["log"][-400:]
+        _persist_job(job)
+    beat = _threading.Event()
+
+    def heartbeat():                       # image copying can run minutes without a log line
+        while not beat.wait(_JOB_HEARTBEAT_SECONDS):
+            _persist_job(job, force=True)
+    if not dry_run:
+        _threading.Thread(target=heartbeat, daemon=True).start()
     try:
         groups = {"products": [], "creators": [], "shops": []}
         for f in files:
@@ -2362,9 +2602,11 @@ def _run_import(job: dict, files: list, dry_run: bool, rehost: bool, deactivate:
         if not dry_run:
             log("Some rows may already be written (snapshots are saved first). Fix the error and run it again; it's safe to repeat.")
     finally:
+        beat.set()
         if not dry_run:
             clear_list_caches()          # also after a failure: snapshots / some batches may be written
         job["finished_at"] = _now()
+        _persist_job(job, force=True)
         _shutil.rmtree(job["dir"], ignore_errors=True)
         if not dry_run and _IMPORT_LOCK.locked():
             _IMPORT_LOCK.release()
@@ -2455,13 +2697,14 @@ async def admin_import(
         if dry_run:  # writes nothing; parsed in the threadpool so big files don't stall the API
             handed_off = True                    # _run_import removes the folder
             await run_in_threadpool(_run_import, job, saved, True, False, False)
-            return {k: v for k, v in job.items() if k != "dir"}
+            return _job_view(job)
 
         if not _IMPORT_LOCK.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="An import is already running. Wait for it to finish.")
         _IMPORT_JOBS[job["id"]] = job
         for old in sorted(_IMPORT_JOBS, key=lambda j: _IMPORT_JOBS[j]["started_at"])[:-10]:
             _IMPORT_JOBS.pop(old, None)
+        await run_in_threadpool(_persist_job, job, True)
         try:
             _threading.Thread(target=_run_import, args=(job, saved, False, rehost, deactivate), daemon=True).start()
         except BaseException:
@@ -2469,7 +2712,7 @@ async def admin_import(
             _IMPORT_LOCK.release()           # else every later import is 409 until a restart
             raise
         handed_off = True
-        return {k: v for k, v in job.items() if k != "dir"}
+        return _job_view(job)
     finally:
         await form.close()
         if not handed_off:
@@ -2481,18 +2724,29 @@ async def admin_import(
 def admin_import_status(job_id: str, request: Request, user=Depends(resolve_user),
                         api_key: str = Security(verify_api_key)):
     require_admin_user(request)
-    job = _IMPORT_JOBS.get(job_id)
+    job = _IMPORT_JOBS.get(job_id) or _stored_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Import not found (the server may have restarted). Run it again; it's safe to repeat.")
-    return {k: v for k, v in job.items() if k != "dir"}
+    return _job_view(job)
 
 
 @app.get("/admin/import")
 @limiter.limit(ADMIN_LIMIT)
 def admin_import_list(request: Request, user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
     require_admin_user(request)
-    jobs = sorted(_IMPORT_JOBS.values(), key=lambda j: j["started_at"], reverse=True)
-    return {"imports": [{k: v for k, v in j.items() if k not in ("dir", "log")} for j in jobs]}
+    jobs = {j["id"]: j for j in _IMPORT_JOBS.values()}
+    if _job_store["ok"]:
+        try:
+            for row in (supabase.table(_JOB_TABLE).select("*").order("started_at", desc=True)
+                        .limit(10).execute().data or []):
+                if row.get("id") not in jobs:
+                    row = dict(row)
+                    row["by"] = row.pop("started_by", None)
+                    jobs[row["id"]] = _mark_if_interrupted(row)
+        except Exception:
+            pass
+    ordered = sorted(jobs.values(), key=lambda j: str(j.get("started_at") or ""), reverse=True)[:10]
+    return {"imports": [{k: v for k, v in _job_view(j).items() if k != "log"} for j in ordered]}
 
 
 def _gh_headers():
@@ -2501,6 +2755,27 @@ def _gh_headers():
         raise HTTPException(status_code=503, detail="Supplier search isn't set up yet: add GITHUB_ACTIONS_TOKEN on Render")
     return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def _gh_error(r) -> str:
+    """Admin-facing reason for a refused GitHub call. GitHub's own message is included (it never
+    contains the token); the 403 case says exactly which token works, because that was the 2026-11
+    failure: a fine-grained token made by a collaborator can't reach a repo owned by another account."""
+    try:
+        gh_msg = str((r.json() or {}).get("message") or "")[:160]
+    except Exception:
+        gh_msg = ""
+    owner, repo = (_GH_REPO.split("/", 1) + [""])[:2]
+    base = {
+        401: "GitHub token on Render (GITHUB_ACTIONS_TOKEN) is wrong or expired.",
+        # Kept under 240 characters: the admin page only shows short server messages.
+        403: (f"GitHub token can't run Actions on {_GH_REPO}. Make a fine-grained token from the {owner} "
+              f"account: repo {repo}, Actions read and write."),
+        404: f"Workflow {_GH_WORKFLOW} not found on {_GH_REPO}@{_GH_REF}, or the token can't see the repo.",
+        422: f"GitHub refused the run: branch {_GH_REF} must contain {_GH_WORKFLOW}.",
+    }.get(r.status_code, f"GitHub error {r.status_code}.")
+    out = f"{base} GitHub said: {gh_msg}" if gh_msg else base
+    return out if len(out) <= 235 else base
 
 
 class SourcingRun(BaseModel):
@@ -2526,10 +2801,7 @@ def admin_sourcing_run(body: SourcingRun, request: Request, user=Depends(resolve
     with httpx.Client(timeout=20) as c:
         r = c.post(url, headers=_gh_headers(), json=payload)
     if r.status_code != 204:
-        msg = {401: "GitHub token is wrong or expired", 403: "GitHub token can't run Actions on this repo",
-               404: "Workflow not found: check GITHUB_REPO and that .github/workflows/presource.yml is on main",
-               422: "GitHub refused the inputs"}.get(r.status_code, f"GitHub error {r.status_code}")
-        raise HTTPException(status_code=502, detail=msg)
+        raise HTTPException(status_code=502, detail=_gh_error(r))
     return {"success": True, "message": "Supplier search started. It takes about 1 to 3 hours for a full run."}
 
 
@@ -2541,7 +2813,7 @@ def admin_sourcing_runs(request: Request, user=Depends(resolve_user), api_key: s
     with httpx.Client(timeout=20) as c:
         r = c.get(url, headers=_gh_headers())
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"GitHub error {r.status_code}")
+        raise HTTPException(status_code=502, detail=_gh_error(r))
     runs = [{"id": x["id"], "status": x["status"], "conclusion": x.get("conclusion"),
              "created_at": x["created_at"], "updated_at": x["updated_at"], "url": x["html_url"],
              "title": x.get("display_title")} for x in r.json().get("workflow_runs", [])]

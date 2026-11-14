@@ -1,7 +1,9 @@
 # "Find suppliers" button on tikprofitpro.shop/admin/upload starts this.
 # You can also start it by hand: GitHub > Actions > Find suppliers > Run workflow.
 # Repo secrets needed (Settings > Secrets and variables > Actions):
-#   SUPABASE_URL, SUPABASE_KEY (service_role), and OXYLABS_WEB_API_KEY (or OXYLABS_USER + OXYLABS_PASS)
+#   SUPABASE_URL, SUPABASE_KEY (service_role), OXYLABS_WEB_API_KEY (Oxylabs Web API key, the only Oxylabs login).
+# The run FAILS (red) when Oxylabs refuses the key or the quota is used up (exit 3), or when every
+# product failed (exit 4). Hitting max_requests is a normal stop (green, with a warning).
 name: Find suppliers
 run-name: Find suppliers (${{ inputs.mode }}, max ${{ inputs.max_requests }}) ${{ inputs.started_by }}
 
@@ -37,13 +39,13 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-      OXYLABS_USER: ${{ secrets.OXYLABS_USER }}
-      OXYLABS_PASS: ${{ secrets.OXYLABS_PASS }}
       OXYLABS_WEB_API_KEY: ${{ secrets.OXYLABS_WEB_API_KEY }}
       SOURCING_MIN_SIMILARITY: ${{ vars.SOURCING_MIN_SIMILARITY || '0.80' }}
       SOURCING_REVIEW_MIN_SIMILARITY: ${{ vars.SOURCING_REVIEW_MIN_SIMILARITY || '0.60' }}
       SOURCING_MATCHING: ${{ vars.SOURCING_MATCHING || 'off' }}
       SOURCING_KEEP_TOP: ${{ vars.SOURCING_KEEP_TOP || '3' }}
+      SOURCING_WORKERS: '1'           # one product at a time (user, 2026-11-14)
+      SOURCING_AE_CONCURRENCY: '1'
       PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
@@ -60,6 +62,7 @@ jobs:
           cache-dependency-path: requirements-presource.txt
 
       - name: Cache image model
+        if: ${{ vars.SOURCING_MATCHING == 'on' }}    # CLIP is only loaded when photo matching is on
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: |
@@ -76,9 +79,11 @@ jobs:
           for v in SUPABASE_URL SUPABASE_KEY; do
             if [ -z "${!v}" ]; then echo "::error::Repo secret $v is missing"; exit 1; fi
           done
-          if [ -z "$OXYLABS_WEB_API_KEY" ] && { [ -z "$OXYLABS_USER" ] || [ -z "$OXYLABS_PASS" ]; }; then
-            echo "::error::Set repo secret OXYLABS_WEB_API_KEY (or OXYLABS_USER + OXYLABS_PASS)"; exit 1
+          if [ -z "$OXYLABS_WEB_API_KEY" ]; then
+            echo "::error::Repo secret OXYLABS_WEB_API_KEY is missing or empty. Add the API key of your Oxylabs Web API instance (Settings > Secrets and variables > Actions > New repository secret). Username/password is no longer used."
+            exit 1
           fi
+          echo "Secrets present: SUPABASE_URL, SUPABASE_KEY, OXYLABS_WEB_API_KEY (values hidden)"
 
       - name: Find suppliers
         # Inputs arrive through env, never pasted into the script, and are validated before use
@@ -99,10 +104,12 @@ jobs:
           esac
           if [ "$IN_LIMIT" != "0" ]; then ARGS+=(--limit "$IN_LIMIT"); fi
           echo "python -m sourcing.presource ${ARGS[*]}"
-          python -m sourcing.presource "${ARGS[@]}" | tee presource.log
+          # pipefail (set above) makes the step fail with presource's own exit code, not tee's.
+          python -m sourcing.presource "${ARGS[@]}" 2>&1 | tee presource.log
 
       - name: Summary
         if: always()
         run: |
           echo "### Find suppliers" >> $GITHUB_STEP_SUMMARY
+          { grep -E "^(STOPPED|::error::|::warning::|\{'done')" presource.log 2>/dev/null | sed 's/^::[a-z]*:://' || true; } >> $GITHUB_STEP_SUMMARY
           tail -n 3 presource.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "No log" >> $GITHUB_STEP_SUMMARY

@@ -20,10 +20,13 @@ import string
 import time
 from urllib.parse import quote
 
+import os
+import threading
+
 import httpx
 
-from . import parse
-from .oxylabs import Budget, OxylabsError, scrape
+from . import oxylabs, parse
+from .oxylabs import Budget, OxylabsError
 
 UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
@@ -38,6 +41,36 @@ class MarketplaceBlocked(RuntimeError):
     NOT a 'no match': the product keeps its old suppliers and is retried next run."""
 
 
+def _json_or_blocked(r: httpx.Response, what: str) -> dict:
+    """r.json(), or MarketplaceBlocked naming the status and the first 200 characters.
+    2026-11-14: AliExpress answered GitHub's runners with a non-JSON page and the run logged only
+    'JSONDecodeError: Expecting value: line 1 column 1 (char 0)'."""
+    try:
+        data = r.json()
+    except ValueError:
+        snippet = " ".join((r.text or "")[:200].split())
+        raise MarketplaceBlocked(f"{what} answered HTTP {r.status_code} with a non-JSON body "
+                                 f"({len(r.content or b'')} bytes): {snippet!r}") from None
+    if not isinstance(data, dict):
+        raise MarketplaceBlocked(f"{what} answered HTTP {r.status_code} with unexpected JSON")
+    return data
+
+
+def scrape(payload: dict, budget: Budget) -> str:
+    """Paid fetch through Oxylabs. Without a key (local free-only runs) a block stays a block
+    instead of stopping the run; presource refuses to start without a key unless told to."""
+    if not oxylabs.configured():
+        raise MarketplaceBlocked("blocked from this IP and no Oxylabs key (OXYLABS_WEB_API_KEY) to retry through")
+    return oxylabs.scrape(payload, budget)
+
+
+# AliExpress started refusing the image-upload call when 8 workers hit it at once from one runner IP
+# (the sequential 2026-11-12 run sourced 561 AliExpress products; the 8-worker 2026-11-14 run got
+# non-JSON answers). Keep AliExpress calls to a few at a time, with a short gap.
+_AE_SLOTS = threading.BoundedSemaphore(max(1, int(os.getenv("SOURCING_AE_CONCURRENCY", "1"))))
+_AE_GAP_SECONDS = float(os.getenv("SOURCING_AE_GAP_SECONDS", "1.5"))
+
+
 def _rand(k: int) -> str:
     return "".join(random.choices(string.ascii_letters, k=k))
 
@@ -45,7 +78,7 @@ def _rand(k: int) -> str:
 def alibaba_upload(photo: bytes, with_host: bool = False):
     """Signed OSS upload (open-s, free, works from datacenter IPs). Returns the imageAddress key,
     or (host, key) with with_host=True."""
-    sign = httpx.get(SIGN_URL, headers=UA, timeout=20).json().get("data") or {}
+    sign = _json_or_blocked(httpx.get(SIGN_URL, headers=UA, timeout=20), "Alibaba upload signer").get("data") or {}
     for k in ("host", "policy", "accessid", "signature", "imagePath"):
         if not sign.get(k):
             raise RuntimeError(f"alibaba upload signature missing {k}")
@@ -199,14 +232,16 @@ def alibaba_by_image(photo: bytes, budget: Budget) -> list[dict]:
 
 
 def alibaba_by_text(keyword: str, budget: Budget) -> list[dict]:
-    html = scrape({"source": "alibaba_search", "query": keyword, "render": "html"}, budget)
-    return _alibaba_from_html(html)
+    # The Web API key fetches URLs only (no "alibaba_search" source), so ask for the search page.
+    url = str(httpx.URL("https://www.alibaba.com/trade/search", params={"SearchText": keyword, "tab": "all"}))
+    return _alibaba_from_html(scrape({"url": url, "render": "html"}, budget))
 
 
 def aliexpress_by_text(keyword: str, budget: Budget) -> list[dict]:
-    html = scrape({"source": "aliexpress_search", "query": keyword, "render": "html",
-                   "geo_location": "United States"}, budget)
-    return parse.aliexpress_offers(parse.json_blobs_from_html(html))
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", keyword).strip("-") or "item"
+    url = f"https://www.aliexpress.com/w/wholesale-{quote(slug)}.html"
+    html = scrape({"url": url}, budget)
+    return parse.aliexpress_offers(parse.aliexpress_init_data(html) + parse.json_blobs_from_html(html))
 
 
 # ─── keyword from a TikTok title, no AI ──────────────────────────────────────
@@ -231,7 +266,7 @@ def _ae_mtop(client: httpx.Client, data: str) -> dict:
     r = client.post(f"https://acs.aliexpress.com/h5/{AE_MTOP_API}/1.0/", params=q, data={"data": data},
                     headers={**UA, "Origin": "https://www.aliexpress.com", "Referer": "https://www.aliexpress.com/"},
                     timeout=60)
-    return r.json()
+    return _json_or_blocked(r, "AliExpress image upload")
 
 
 def aliexpress_upload(photo: bytes) -> str:
@@ -254,7 +289,10 @@ def aliexpress_upload(photo: bytes) -> str:
             j = _ae_mtop(c, data)
     d = j.get("data") or {}
     if not d.get("fileId"):
-        raise RuntimeError(f"AliExpress image upload refused: {(j.get('ret') or ['?'])[0][:80]}")
+        ret = (j.get("ret") or ["?"])[0][:80]
+        if any(x in ret for x in ("FAIL_SYS", "TOKEN", "RGV587", "USER_VALIDATE")):
+            raise MarketplaceBlocked(f"AliExpress image upload refused: {ret}")   # gateway / anti-bot
+        raise RuntimeError(f"AliExpress image upload refused: {ret}")
     return d["fileId"]
 
 
@@ -290,7 +328,17 @@ def _ae_page_offers(html: str) -> list[dict]:
 def aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
     """AliExpress photo search, exactly like its camera button: upload (free) -> fileId, then the
     results page /w/wholesale-.html?isNewImageSearch=y&filename=<fileId>&imageId=<ms>, which is
-    server-rendered with the 60 cards embedded. Direct first; Oxylabs only if blocked."""
+    server-rendered with the 60 cards embedded. Direct first; Oxylabs only if blocked.
+    The upload is a signed POST to AliExpress's gateway, which the Web API (GET a URL) can't make:
+    when the gateway blocks the runner, the product is 'failed' (old suppliers kept, retried next run)."""
+    with _AE_SLOTS:
+        try:
+            return _aliexpress_by_image(photo, budget)
+        finally:
+            time.sleep(_AE_GAP_SECONDS)
+
+
+def _aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
     file_id = aliexpress_upload(photo)
     stamp = int(time.time() * 1000)
     q = "/w/wholesale-.html?isNewImageSearch=y&filename=" + quote(file_id, safe="") + f"&imageId={stamp}"
@@ -309,10 +357,14 @@ def aliexpress_by_image(photo: bytes, budget: Budget) -> list[dict]:
         last = e
     except Exception:
         pass
-    # blocked from this IP: same page through Oxylabs (1 paid result), no JavaScript rendering
+    # blocked from this IP: same page through Oxylabs (1 paid result), no JavaScript rendering.
+    # An OxylabsError (bad key, no quota) is fatal and is NOT swapped for the page-blocked error:
+    # that used to hide a rejected key behind "AliExpress challenge page" on every product.
     try:
         html = scrape({"source": "universal", "url": url, "geo_location": "United States"}, budget)
     except OxylabsError:
+        raise
+    except MarketplaceBlocked:
         if last:
             raise last
         raise
