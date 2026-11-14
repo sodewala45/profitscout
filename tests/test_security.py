@@ -229,16 +229,18 @@ def test_webhook_signed_user_id_and_mismatch():
     send_webhook("subscription_created", custom={"user_id": u.id, "email": "carol@example.com", "sig": sig},
                  user_email="Carol@Example.com ")
     assert plans()["carol@example.com"] == "pro"
-    # signed id but the order email is someone else's: ignored entirely
-    u2 = DB.add_user("t2", "dave@example.com")
-    send_webhook("subscription_created", sub_id="sub9",
-                 custom={"user_id": u2.id, "email": "victim@example.com", "sig": main._checkout_sig(u2.id)},
-                 user_email="victim@example.com")
-    assert plans()["dave@example.com"] == "free" and plans()["victim@example.com"] == "free"
     # forged (unsigned) user id falls back to exact email only
+    u2 = DB.add_user("t2", "dave@example.com")
     send_webhook("subscription_created", sub_id="sub10", custom={"user_id": u2.id, "sig": "bad"},
                  user_email="nobody@example.com")
     assert plans()["dave@example.com"] == "free"
+    # signed id but the buyer typed another email at checkout: the signed-in account that paid gets
+    # the plan (plans audit 2026-11-14: this used to be ignored and left the payer on Free); the other
+    # address gets nothing.
+    send_webhook("subscription_created", sub_id="sub9",
+                 custom={"user_id": u2.id, "email": "victim@example.com", "sig": main._checkout_sig(u2.id)},
+                 user_email="victim@example.com")
+    assert plans()["dave@example.com"] == "pro" and plans()["victim@example.com"] == "free"
 
 
 def test_webhook_out_of_order_event_ignored():
@@ -274,6 +276,8 @@ def test_webhook_rejects_bad_signature():
 
 
 def test_checkout_sends_signed_user_id(monkeypatch):
+    monkeypatch.setenv("LEMONSQUEEZY_API_KEY", "k")
+    monkeypatch.setenv("LEMONSQUEEZY_STORE_ID", "1")
     u = DB.add_user("t", "hal@example.com")
     sent = {}
 

@@ -18,6 +18,7 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 from supplier_engine import find_suppliers, find_suppliers_by_platform, initialize_credits
 import credits as credits_v2
+import billing_diag
 from db_paging import fetch_all, count_exact
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -239,11 +240,16 @@ def access_plan(user, db_plan: Optional[str]) -> str:
     return normalize_plan(db_plan)
 
 
+def _db_plan_or_raise(email: str) -> str:
+    """users.plan for this email ('free' when there is no row). Raises when the lookup fails."""
+    rows = supabase.table("users").select("plan").eq("user_email", normalize_email(email)).limit(1).execute().data
+    return normalize_plan(rows[0].get("plan") if rows else None)
+
+
 def _db_plan(email: str) -> str:
     """users.plan for this email; 'free' when there is no row or the lookup fails (fail closed)."""
     try:
-        rows = supabase.table("users").select("plan").eq("user_email", normalize_email(email)).limit(1).execute().data
-        return normalize_plan(rows[0].get("plan") if rows else None)
+        return _db_plan_or_raise(email)
     except Exception:
         logger.exception("plan lookup failed")
         return "free"
@@ -1113,6 +1119,16 @@ def ultimate_variant_ids() -> list[str]:
     return _env_ids("LEMONSQUEEZY_ULTIMATE_PRODUCT_ID", "LEMON_ULTIMATE_VARIANT_IDS")
 
 
+def pro_product_ids() -> list[str]:
+    # Lemon Squeezy PRODUCT ids (not variants). The legacy LEMONSQUEEZY_PRODUCT_ID is matched here too:
+    # its name invites pasting the product id, and then every Pro webhook used to be "unknown variant".
+    return _env_ids("LEMON_PRO_PRODUCT_IDS", "LEMONSQUEEZY_PRODUCT_ID")
+
+
+def ultimate_product_ids() -> list[str]:
+    return _env_ids("LEMON_ULTIMATE_PRODUCT_IDS", "LEMONSQUEEZY_ULTIMATE_PRODUCT_ID")
+
+
 # Lemon Squeezy subscription statuses -> do they keep the paid plan?
 #   active, on_trial            paid
 #   cancelled                   paid until ends_at (LS sends subscription_expired when it really ends)
@@ -1128,6 +1144,21 @@ def _plan_for_variant(variant_id: str) -> Optional[str]:
     if variant_id in ultimate_variant_ids():
         return "ultimate"
     if variant_id in pro_variant_ids():
+        return "pro"
+    return None
+
+
+def _plan_for_ids(variant_id, product_id=None) -> Optional[str]:
+    """Plan for a webhook's variant id, else its product id (ints or strings both work)."""
+    plan = _plan_for_variant(str(variant_id or ""))
+    if plan:
+        return plan
+    product_id = str(product_id or "").strip()
+    if not product_id:
+        return None
+    if product_id in ultimate_product_ids():
+        return "ultimate"
+    if product_id in pro_product_ids():
         return "pro"
     return None
 
@@ -1177,10 +1208,11 @@ def _resolve_webhook_user(meta: dict, attrs: dict) -> tuple[str, Optional[str]]:
                 auth_user = None
             if auth_user and auth_user.email:
                 auth_email = normalize_email(auth_user.email)
-                claimed = {e for e in (attrs_email, custom_email) if e}
-                if claimed and auth_email not in claimed:
-                    logger.warning("webhook: user_id %s email does not match the order email; event ignored", uid)
-                    return "", None
+                # The signature proves /create-checkout made this checkout for this signed-in user, so the
+                # account wins even when the buyer typed another email (e.g. their PayPal one) at checkout.
+                # Ignoring the event here used to leave a paying customer on Free.
+                if attrs_email and attrs_email != auth_email:
+                    logger.info("webhook: order email differs from account %s; plan goes to the account", uid)
                 return auth_email, uid
             logger.warning("webhook: user_id %s not found; falling back to exact email", uid)
         else:
@@ -1204,20 +1236,24 @@ def _record_subscription(sub_id: str, email: str, user_id: Optional[str], varian
         return None
 
 
-def _effective_plan(email: str, user_id: Optional[str], fallback: str) -> str:
+def _effective_plan(email: str, user_id: Optional[str], fallback: str, sub_id: str = "") -> str:
     """Best plan over all of this user's subscriptions that still pay. One lapsed subscription no
-    longer downgrades someone who holds another active one (audit M4)."""
+    longer downgrades someone who holds another active one (audit M4). The subscription this event is
+    about counts as `fallback` (already worked out from variant OR product id), so a product-id match
+    is not lost by re-reading only the stored variant id."""
     try:
-        rows = (supabase.table("subscriptions").select("variant_id, status")
+        rows = (supabase.table("subscriptions").select("ls_subscription_id, variant_id, status")
                 .eq("user_email", email).execute().data or [])
         if user_id:
-            rows += (supabase.table("subscriptions").select("variant_id, status")
+            rows += (supabase.table("subscriptions").select("ls_subscription_id, variant_id, status")
                      .eq("user_id", user_id).execute().data or [])
     except Exception:
         logger.exception("webhook: subscriptions read failed; using this event's plan")
         return fallback
-    best = "free"
+    best = fallback if sub_id else "free"
     for r in rows:
+        if sub_id and str(r.get("ls_subscription_id") or "") == sub_id:
+            continue
         if (r.get("status") or "").lower() in PAID_STATUSES:
             p = _plan_for_variant(str(r.get("variant_id") or "")) or "free"
             if _PLAN_RANK[p] > _PLAN_RANK[best]:
@@ -1229,9 +1265,17 @@ class WebhookRetry(Exception):
     """Processing failed in a way a Lemon Squeezy retry can fix: answer 500, don't mark processed."""
 
 
-def _set_plan(email: str, plan: str, new_period: bool) -> None:
+def _set_plan(email: str, plan: str, new_period: bool, user_id: Optional[str] = None) -> None:
     email = normalize_email(email)
     res = supabase.table("users").update({"plan": plan}).eq("user_email", email).execute()
+    if not res.data and user_id:
+        # The DB helper from 20261111_launch_day.sql knows which columns public.users really has
+        # (id / user_id / credits), so it can create the row where a bare insert would fail.
+        try:
+            supabase.rpc("tpp_ensure_user_row", {"p_id": user_id, "p_email": email}).execute()
+            res = supabase.table("users").update({"plan": plan}).eq("user_email", email).execute()
+        except Exception:
+            logger.warning("Webhook: tpp_ensure_user_row unavailable; inserting the users row directly")
     if not res.data:
         # No users row (signup trigger missing or late). Create it so the payment isn't lost.
         logger.error("Webhook: no users row for user %s; creating it with plan %s", email_hash(email), plan)
@@ -1313,13 +1357,19 @@ def _process_webhook(payload: dict) -> dict:
                     raise WebhookRetry("start_credit_period failed")
         return {"status": "ok"}
 
+    if event_name == "order_created":
+        return _process_order_created(meta, data, attrs, email, user_id)
+
     if not event_name.startswith("subscription_"):
         return {"status": "ok"}
 
     variant_id = str(attrs.get("variant_id") or "")
-    plan = _plan_for_variant(variant_id)
+    plan = _plan_for_ids(variant_id, attrs.get("product_id"))
     if plan is None:
-        logger.info("Webhook %s: unknown variant %s; ignored", event_name, variant_id)
+        # WARNING, not INFO: this is the line that explains "I paid and I'm still Free".
+        logger.warning("Webhook %s: unknown variant %s / product %s (test_mode=%s); ignored. "
+                       "Add it to LEMON_PRO_VARIANT_IDS / LEMON_ULTIMATE_VARIANT_IDS.",
+                       event_name, variant_id, attrs.get("product_id"), bool(meta.get("test_mode")))
         return {"status": "ok"}
 
     status = "expired" if event_name == "subscription_expired" else (attrs.get("status") or "").lower()
@@ -1330,9 +1380,34 @@ def _process_webhook(payload: dict) -> dict:
         return {"status": "ok", "stale": True}
 
     event_plan = plan if status in PAID_STATUSES else "free"
-    new_plan = event_plan if applied is None else _effective_plan(email, user_id, event_plan)
-    _set_plan(email, new_plan, new_period=(event_name == "subscription_created" and new_plan != "free"))
+    new_plan = (event_plan if applied is None
+                else _effective_plan(email, user_id, event_plan, str(data.get("id") or "")))
+    _set_plan(email, new_plan, new_period=(event_name == "subscription_created" and new_plan != "free"),
+              user_id=user_id)
     logger.info("user %s -> %s (%s, status=%s)", email_hash(email), new_plan, event_name, status)
+    return {"status": "ok"}
+
+
+def _process_order_created(meta: dict, data: dict, attrs: dict, email: str, user_id: Optional[str]) -> dict:
+    """A paid order for a Pro/Ultimate variant UPGRADES right away (never downgrades). Covers a store
+    where only order_created is ticked, a one-off (non-subscription) variant, and subscription_created
+    arriving late. Downgrades still come only from subscription_* events."""
+    item = attrs.get("first_order_item") or {}
+    if not isinstance(item, dict):
+        item = {}
+    plan = _plan_for_ids(item.get("variant_id"), item.get("product_id"))
+    if plan is None:
+        logger.warning("Webhook order_created: unknown variant %s / product %s (test_mode=%s); ignored",
+                       item.get("variant_id"), item.get("product_id"), bool(meta.get("test_mode")))
+        return {"status": "ok"}
+    if (attrs.get("status") or "").lower() != "paid":
+        logger.info("Webhook order_created: order %s status %s; not upgrading", data.get("id"), attrs.get("status"))
+        return {"status": "ok"}
+    current = _db_plan(email)
+    if _PLAN_RANK[plan] <= _PLAN_RANK[current]:
+        return {"status": "ok"}
+    _set_plan(email, plan, new_period=True, user_id=user_id)
+    logger.info("user %s -> %s (order_created)", email_hash(email), plan)
     return {"status": "ok"}
 
 
@@ -1368,6 +1443,9 @@ async def lemonsqueezy_webhook(request: Request):
 # ==============================================================================
 # ENDPOINT 12 — Create Checkout (supports Pro + Ultimate)
 # ==============================================================================
+CHECKOUT_REDIRECT_URL = os.getenv("CHECKOUT_REDIRECT_URL", "https://tikprofitpro.shop/dashboard?checkout=success")
+
+
 class CheckoutRequest(BaseModel):
     email: str = ""          # ignored: the signed-in user's email is used
     plan:  str = "pro"
@@ -1385,8 +1463,10 @@ def create_checkout(checkout_data: CheckoutRequest, request: Request, user=Depen
     # Checkout uses the plan's first configured variant (the old single var, else the list's first).
     ids = ultimate_variant_ids() if checkout_data.plan == "ultimate" else pro_variant_ids()
     variant_id = ids[0] if ids else None
-    if not variant_id:
-        logger.error("checkout: no variant configured for plan %s", checkout_data.plan)
+    if not variant_id or not os.getenv("LEMONSQUEEZY_API_KEY") or not os.getenv("LEMONSQUEEZY_STORE_ID"):
+        logger.error("checkout: plan %s not configured (variant set=%s, LEMONSQUEEZY_API_KEY set=%s, "
+                     "LEMONSQUEEZY_STORE_ID set=%s)", checkout_data.plan, bool(variant_id),
+                     bool(os.getenv("LEMONSQUEEZY_API_KEY")), bool(os.getenv("LEMONSQUEEZY_STORE_ID")))
         raise HTTPException(status_code=503, detail="Checkout is not available right now. Please try again later.")
 
     logger.info("checkout: plan=%s user=%s", checkout_data.plan, user.id)
@@ -1401,6 +1481,8 @@ def create_checkout(checkout_data: CheckoutRequest, request: Request, user=Depen
         "data": {
             "type": "checkouts",
             "attributes": {
+                # Back to the app after paying; the app polls /me until the webhook has set the plan.
+                "product_options": {"redirect_url": CHECKOUT_REDIRECT_URL},
                 "checkout_data": {
                     "email": checkout_data.email,
                     "custom": {
@@ -1439,7 +1521,14 @@ def create_checkout(checkout_data: CheckoutRequest, request: Request, user=Depen
         raise HTTPException(status_code=502, detail="Checkout creation failed")
 
     if response.status_code not in (200, 201):
-        logger.error("LemonSqueezy checkout failed with HTTP %s", response.status_code)
+        # Lemon Squeezy's error titles/details name the problem (wrong variant / store id, test vs live
+        # API key); they never contain the key itself.
+        try:
+            errs = [f"{e.get('title')}: {e.get('detail')}" for e in (response.json().get("errors") or [])][:3]
+        except Exception:
+            errs = []
+        logger.error("LemonSqueezy checkout failed with HTTP %s (variant %s, store %s): %s",
+                     response.status_code, variant_id, os.getenv("LEMONSQUEEZY_STORE_ID"), "; ".join(errs)[:500])
         raise HTTPException(status_code=400, detail="Checkout creation failed")
 
     data = response.json()
@@ -2257,8 +2346,24 @@ def me(request: Request, user=Depends(resolve_user), api_key: str = Security(ver
     if not user:
         return {"signed_in": False, "plan": "free", "billing_plan": "free", "admin": False}
     admin = is_admin(user)
-    billing = _db_plan(user.email)
+    try:
+        billing = _db_plan_or_raise(user.email)
+    except Exception:
+        # Saying "free" here made a paying user's whole UI (sidebar, products, settings) show Free for a
+        # minute on any DB hiccup. A 503 lets the app retry instead. Access checks still fail closed.
+        logger.exception("/me: plan lookup failed")
+        raise HTTPException(status_code=503, detail="Plan lookup failed, please retry")
     return {"signed_in": True, "plan": access_plan(user, billing), "billing_plan": billing, "admin": admin}
+
+
+@app.get("/admin/billing/lookup")
+@limiter.limit(ADMIN_LIMIT)
+def admin_billing_lookup(request: Request, email: str = Query(..., min_length=3, max_length=320),
+                         user=Depends(resolve_user), api_key: str = Security(verify_api_key)):
+    """Read-only support view for "I paid but I'm still Free": users.plan, subscriptions, credits and
+    recent webhook events for one email, plus which variant ids the API recognises. Admins only."""
+    require_admin_user(request)
+    return billing_diag.billing_snapshot(supabase, email, _plan_for_variant)
 
 
 @app.get("/admin/review/queue")
